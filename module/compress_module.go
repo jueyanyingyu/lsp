@@ -1,9 +1,10 @@
 package module
 
 import (
-	"errors"
+	"github.com/jueyanyingyu/lsp/config"
 	"io"
 	"log"
+	"strings"
 )
 
 type CompressModule struct {
@@ -19,296 +20,398 @@ func NewCompressModule(reader *io.PipeReader, writer *io.PipeWriter) *CompressMo
 }
 
 func (m *CompressModule) Compress() error {
-	var buffer []uint8
-	var encoder *lz4SequenceEncoder
-	var noMore bool
-	var finish bool
-	for !noMore || !finish {
-		if len(buffer) == 0 && !noMore {
-			nb := make([]uint8, 64)
-			n, err := m.reader.Read(nb)
-			if n > 0 {
-				buffer = append(buffer, nb[0:n]...)
+	encoder := newLz77SequenceEncoder()
+	for {
+		var buffer []uint8
+		nb := make([]uint8, config.BufferSize)
+		n, err := m.reader.Read(nb)
+		if n > 0 {
+			buffer = append(buffer, nb[0:n]...)
+			//fmt.Printf("buffer:%v",buffer)
+			var result []uint8
+			for _, v := range buffer {
+				//fmt.Printf("v:%v",v)
+				result = append(result, encoder.compressWithNewByte(v)...)
 			}
-			if err != nil && err != io.EOF {
-				log.Printf("read from stream err:%v", err)
+			_, err := m.writer.Write(result)
+			if err != nil {
+				log.Printf("write to stream err:%v", err)
 				return err
 			}
-			if err == io.EOF {
-				noMore = true
-			}
 		}
-
-		if encoder == nil {
-			encoder = newLz4SequenceEncoder()
+		if err != nil && err != io.EOF {
+			log.Printf("read from stream err:%v", err)
+			return err
 		}
-		if encoder.done {
-			//fmt.Printf("seq:%v\n", encoder.getByByte())
-			result := encoder.getByByte()
+		if err == io.EOF {
+			var result []uint8
+			result = append(result, encoder.compress()...)
 			//fmt.Printf("result:%v",result)
-			if len(result) == 0 {
-				finish = true
-			}
-			n, err := m.writer.Write(result)
-			if n < len(result) || err != nil {
-				log.Printf("write ot stream err:%v", err)
+			_, err := m.writer.Write(result)
+			if err != nil {
+				log.Printf("write to stream err:%v", err)
 				return err
 			}
-			//fmt.Printf("badbuffer:%v\n",encoder.badBuffer)
-			buffer = append(encoder.badBuffer, buffer...)
-			encoder = nil
-			continue
-		}
-		if len(buffer) == 0 {
-			encoder.compress()
-		} else {
-			//fmt.Printf("%v",buffer[0])
-			encoder.compressWithNewByte(buffer[0])
-			buffer = buffer[1:]
+			break
 		}
 	}
-	//fmt.Printf("compress close the writer\n")
 	err := m.writer.Close()
 	if err != nil {
-		log.Printf("close writer err:%v", err)
+		log.Printf("close write err:%v", err)
 		return err
 	}
 	return nil
 }
 
 func (m *CompressModule) Decompress() error {
-	var buffer []uint8
-	var decoder *lz4SequenceDecoder
-	var noMore bool
+	decoder := newLz77SequenceDecoder()
 	for {
-		if len(buffer) == 0 && !noMore {
-			nb := make([]uint8, 64)
-			n, err := m.reader.Read(nb)
-			if n > 0 {
-				//fmt.Printf("%v",nb[0:n])
-				buffer = append(buffer, nb[0:n]...)
+		var buffer []uint8
+		nb := make([]uint8, config.BufferSize)
+		n, err := m.reader.Read(nb)
+		if n > 0 {
+			buffer = append(buffer, nb[0:n]...)
+			//fmt.Printf("buffer:%v\n",buffer)
+			var result []uint8
+			for _, v := range buffer {
+				result = append(result, decoder.decompressWithNewByte(v)...)
 			}
-			if err != nil && err != io.EOF {
-				log.Printf("read from stream err:%v", err)
+			//fmt.Printf("%v",decoder.result)
+			_, err := m.writer.Write(result)
+			if err != nil {
+				log.Printf("write to stream err:%v", err)
 				return err
 			}
-			if err == io.EOF {
-				noMore = true
-			}
 		}
-		if decoder == nil {
-			decoder = newLz4SequenceDecoder()
+		if err != nil && err != io.EOF {
+			log.Printf("read from stream err:%v", err)
+			return err
 		}
-		if decoder.done {
-			result := decoder.getByByte()
+		if err == io.EOF {
+			var result []uint8
+			result = append(result, decoder.result...)
 			//fmt.Printf("result:%v",result)
-			n, err := m.writer.Write(result)
-			if n < len(result) || err != nil {
-				log.Printf("write ot stream err:%v", err)
+			_, err := m.writer.Write(result)
+			if err != nil {
+				log.Printf("write to stream err:%v", err)
 				return err
 			}
-			decoder = nil
-			if noMore {
-				break
-			}
-			continue
-		}
-		//fmt.Printf("%v\n",decoder.sequence)
-		if len(buffer) == 0 {
-			log.Printf("broken data")
-			return errors.New("broken data")
-		} else {
-			decoder.decompressWithNewByte(buffer[0])
-			buffer = buffer[1:]
+			break
 		}
 	}
-	//fmt.Printf("decompress close the writer\n")
 	err := m.writer.Close()
 	if err != nil {
-		log.Printf("close writer err:%v", err)
+		log.Printf("close write err:%v", err)
 		return err
 	}
 	return nil
 }
 
-type sequence struct {
-	literalsLen uint8
-	literals    []uint8
-	offset      uint8
-	matchLen    uint8
-}
-
-type lz4SequenceEncoder struct {
-	done     bool
-	anchor   uint8
-	hashMap  map[uint32]uint8
-	sequence sequence
-
-	headerBuffer []uint8
-	badBuffer    []uint8
-}
-
-func newLz4SequenceEncoder() *lz4SequenceEncoder {
-	return &lz4SequenceEncoder{
-		hashMap: make(map[uint32]uint8),
+func getLongestPrefix(slidingWindow []uint8, headBuffer []uint8) (uint16, uint16, uint8) {
+	var maxLength uint16
+	var maxLengthOffset uint16
+	var next uint8
+	for i := len(headBuffer) - 1; i > 0; i-- {
+		index := strings.Index(string(slidingWindow), string(headBuffer[:i]))
+		if index >= 0 {
+			maxLength = uint16(i)
+			maxLengthOffset = uint16(index)
+			next = headBuffer[i]
+			break
+		}
 	}
+	if maxLength == 0 {
+		next = headBuffer[0]
+	}
+	return maxLengthOffset, maxLength, next
 }
 
-func (e *lz4SequenceEncoder) compressWithNewByte(nb uint8) {
-	//fmt.Printf("\ncompress:nb:%v\n",nb)
-	//fmt.Printf("\nsequence:%v", e.sequence)
-	//已经完成本块的压缩，正常不应为true
-	if e.done {
-		return
-	}
-	e.headerBuffer = append(e.headerBuffer, nb)
+type lz77SequenceEncoder struct {
+	slidingWindow []uint8
+	headerBuffer  []uint8
+
+	matchStatus bool
+	literalNum  uint16
+	matchNum    uint16
+	result      []uint8
+}
+
+func newLz77SequenceEncoder() *lz77SequenceEncoder {
+	return &lz77SequenceEncoder{}
+}
+
+func (e *lz77SequenceEncoder) compressWithNewByte(nb uint8) []uint8 {
+	//fmt.Printf("nb:%v",nb)
 	//缓冲区不足补入
-	if len(e.headerBuffer) < 4 {
-		return
+	if len(e.headerBuffer) < config.HeaderBufferSize {
+		//fmt.Printf("nb:%v",nb)
+		e.headerBuffer = append(e.headerBuffer, nb)
+		return nil
 	}
-	//if e.sequence.literalsLen < 3 {
-	//	e.sequence.literalsLen++
-	//	e.sequence.literals = append(e.sequence.literals, e.headerBuffer[0])
-	//	e.anchor++
-	//	e.headerBuffer = e.headerBuffer[1:]
-	//	return
-	//}
-	var b1, b2, b3, b4 uint8
-	b1 = e.headerBuffer[0]
-	b2 = e.headerBuffer[1]
-	b3 = e.headerBuffer[2]
-	b4 = e.headerBuffer[3]
-	b := uint32(b1)<<24 + uint32(b2)<<16 + uint32(b3)<<8 + uint32(b4)
-	//fmt.Printf("index:%v\n", e.hashMap[b])
-	if index, ok := e.hashMap[b]; !ok || index+4 > e.sequence.literalsLen {
-		//之前已经压缩,新字节无法继续压缩
-		if e.sequence.offset != 0 {
-			e.badBuffer = append(e.badBuffer, nb)
-			e.done = true
+	offset, matchLen, next := getLongestPrefix(e.slidingWindow, e.headerBuffer)
+	//fmt.Printf("offset:%v,matchLen:%v,next:%v",offset,matchLen,next)
+	//补偿因为滑动窗口未满导致的偏移误差
+	if matchLen != 0 {
+		offset = offset + uint16(config.SlidingWindowSize-len(e.slidingWindow))
+	}
+	//匹配部分加入滑动窗口
+	e.slidingWindow = append(e.slidingWindow, e.headerBuffer[:matchLen+1]...)
+	//滑动窗口舍弃旧数据使得大小不超过上限
+	if len(e.slidingWindow) > config.SlidingWindowSize {
+		e.slidingWindow = e.slidingWindow[len(e.slidingWindow)-config.SlidingWindowSize:]
+	}
+	e.headerBuffer = e.headerBuffer[matchLen+1:]
+	if len(e.headerBuffer) < config.HeaderBufferSize {
+		//fmt.Printf("nb:%v",nb)
+		e.headerBuffer = append(e.headerBuffer, nb)
+	}
+
+	var toReturn []uint8
+	if !e.matchStatus {
+		//字面量状态
+		if matchLen == 0 {
+			//新增字面量
+			e.literalNum++
+			e.result = append(e.result, next)
 		} else {
-			//从未遇到的组合，记录hash表中
-			if !ok {
-				e.hashMap[b] = e.anchor
-			}
-			e.sequence.literalsLen++
-			e.sequence.literals = append(e.sequence.literals, e.headerBuffer[0])
-			e.anchor++
-			e.headerBuffer = e.headerBuffer[1:]
-			//检查字面数组是否已达上限
-			if e.sequence.literalsLen == 255 {
-				e.done = true
-				e.badBuffer = append(e.badBuffer, e.headerBuffer...)
-			}
+			//出现匹配项，字面量数据输出
+			toReturn = append(toReturn, uint8(e.literalNum>>8))
+			toReturn = append(toReturn, uint8(e.literalNum))
+			toReturn = append(toReturn, e.result...)
+			e.literalNum = 0
+			e.result = nil
+			e.matchStatus = true
+
+			//新增匹配项
+			e.matchNum++
+			e.result = append(e.result, uint8(offset>>8))
+			e.result = append(e.result, uint8(offset))
+			e.result = append(e.result, uint8(matchLen>>8))
+			e.result = append(e.result, uint8(matchLen))
+			e.result = append(e.result, next)
 		}
 	} else {
-		//之前已经试图压缩
-		if e.sequence.offset != 0 {
-			//尝试扩展
-			//fmt.Printf("b4:%c,nb:%c,anchor:%v,index:%v,offset:%v\n", b4, nb, e.anchor, index, e.sequence.offset)
-			if e.anchor-index == e.sequence.offset {
-				e.sequence.matchLen++
-				e.anchor++
-				e.headerBuffer = e.headerBuffer[1:]
-				//匹配字符串已达上限
-				if e.sequence.matchLen == 255 {
-					e.done = true
-				}
+		if matchLen == 0 {
+			//出现字面量，匹配项数据输出
+			//fmt.Printf("e.matchNum:%v",e.matchNum)
+			toReturn = append(toReturn, uint8(e.matchNum>>8))
+			toReturn = append(toReturn, uint8(e.matchNum))
+			toReturn = append(toReturn, e.result...)
+			e.matchNum = 0
+			e.result = nil
+			e.matchStatus = false
+
+			//新增字面量
+			e.literalNum++
+			e.result = append(e.result, next)
+		} else {
+			//新增匹配项
+			e.matchNum++
+			e.result = append(e.result, uint8(offset>>8))
+			e.result = append(e.result, uint8(offset))
+			e.result = append(e.result, uint8(matchLen>>8))
+			e.result = append(e.result, uint8(matchLen))
+			e.result = append(e.result, next)
+		}
+	}
+	return toReturn
+}
+
+func (e *lz77SequenceEncoder) compress() []uint8 {
+	var totalResult []uint8
+	for len(e.headerBuffer) > 0 {
+		offset, matchLen, next := getLongestPrefix(e.slidingWindow, e.headerBuffer)
+		//补偿因为滑动窗口未满导致的偏移误差
+		if matchLen != 0 {
+			offset = offset + uint16(config.SlidingWindowSize-len(e.slidingWindow))
+		}
+		//fmt.Printf("slidingWindow:%v\n",e.slidingWindow)
+		//fmt.Printf("headerBuffer:%v\n",e.headerBuffer)
+		//fmt.Printf("offset:%v,matchLen:%v,next:%v\n",offset,matchLen,next)
+		//匹配部分加入滑动窗口
+		e.slidingWindow = append(e.slidingWindow, e.headerBuffer[:matchLen+1]...)
+		//滑动窗口舍弃旧数据使得大小不超过上限
+		if len(e.slidingWindow) > config.SlidingWindowSize {
+			e.slidingWindow = e.slidingWindow[len(e.slidingWindow)-config.SlidingWindowSize:]
+		}
+		e.headerBuffer = e.headerBuffer[matchLen+1:]
+		//fmt.Printf("slidingWindow:%v",e.slidingWindow)
+		//fmt.Printf("headerBuffer:%v\n",e.headerBuffer)
+		var toReturn []uint8
+		if !e.matchStatus {
+			//字面量状态
+			if matchLen == 0 {
+				//新增字面量
+				e.literalNum++
+				e.result = append(e.result, next)
 			} else {
-				//无法扩展
-				e.badBuffer = append(e.badBuffer, nb)
-				e.done = true
+				//出现匹配项，字面量数据输出
+				toReturn = append(toReturn, uint8(e.literalNum>>8))
+				toReturn = append(toReturn, uint8(e.literalNum))
+				toReturn = append(toReturn, e.result...)
+				e.literalNum = 0
+				e.result = nil
+				e.matchStatus = true
+
+				//新增匹配项
+				e.matchNum++
+				e.result = append(e.result, uint8(offset>>8))
+				e.result = append(e.result, uint8(offset))
+				e.result = append(e.result, uint8(matchLen>>8))
+				e.result = append(e.result, uint8(matchLen))
+				e.result = append(e.result, next)
 			}
 		} else {
-			e.sequence.offset = e.anchor - index
-			e.sequence.matchLen = 4
-			e.headerBuffer = e.headerBuffer[1:]
-			e.anchor++
+			if matchLen == 0 {
+				//出现字面量，匹配项数据输出
+				//fmt.Printf("e.matchNum:%v",e.matchNum)
+				toReturn = append(toReturn, uint8(e.matchNum>>8))
+				toReturn = append(toReturn, uint8(e.matchNum))
+				toReturn = append(toReturn, e.result...)
+				e.matchNum = 0
+				e.result = nil
+				e.matchStatus = false
+
+				//新增字面量
+				e.literalNum++
+				e.result = append(e.result, next)
+			} else {
+				//新增匹配项
+				e.matchNum++
+				e.result = append(e.result, uint8(offset>>8))
+				e.result = append(e.result, uint8(offset))
+				e.result = append(e.result, uint8(matchLen>>8))
+				e.result = append(e.result, uint8(matchLen))
+				e.result = append(e.result, next)
+			}
 		}
+		totalResult = append(totalResult, toReturn...)
 	}
+	totalResult = append(totalResult, uint8(e.matchNum>>8))
+	totalResult = append(totalResult, uint8(e.matchNum))
+	totalResult = append(totalResult, e.result...)
+	//fmt.Printf("result:%v",totalResult)
+	return totalResult
 }
 
-func (e *lz4SequenceEncoder) compress() {
-	if e.done {
-		return
-	}
-	for e.sequence.offset == 0 && len(e.headerBuffer) > 0 {
-		//fmt.Printf("offset:%v,len:%v\n",e.sequence.offset,len(e.headerBuffer))
-		if e.sequence.literalsLen == 255 {
-			e.badBuffer = append(e.badBuffer, e.headerBuffer...)
-			e.headerBuffer = nil
+type lz77SequenceDecoder struct {
+	slidingWindow []uint8
+	offset        uint16
+	matchLen      uint16
+	offsetDone1   bool
+	offsetDone2   bool
+	matchLenDone1 bool
+	matchLenDone2 bool
+
+	matchStatus     bool
+	literalNum      uint16
+	literalNumDone1 bool
+	literalNumDone2 bool
+	matchNum        uint16
+	matchNumDone1   bool
+	matchNumDone2   bool
+	result          []uint8
+}
+
+func newLz77SequenceDecoder() *lz77SequenceDecoder {
+	return &lz77SequenceDecoder{}
+}
+
+func (d *lz77SequenceDecoder) decompressWithNewByte(nb uint8) []uint8 {
+	//fmt.Printf("%v ",nb)
+	var toReturn []uint8
+	if !d.matchStatus {
+		if !d.literalNumDone1 {
+			d.literalNum = uint16(nb) << 8
+			d.literalNumDone1 = true
+			return nil
+		}
+		if !d.literalNumDone2 {
+			d.literalNum = d.literalNum + uint16(nb)
+			d.literalNumDone2 = true
+			return nil
+		}
+		if d.literalNum > 0 {
+			d.result = append(d.result, nb)
+			d.slidingWindow = append(d.slidingWindow, nb)
+			d.literalNum--
 		} else {
-			e.sequence.literalsLen++
-			e.sequence.literals = append(e.sequence.literals, e.headerBuffer[0])
-			e.headerBuffer = e.headerBuffer[1:]
-			e.anchor++
+			toReturn = append(toReturn, d.result...)
+
+			d.matchStatus = true
+			d.literalNumDone1 = false
+			d.literalNumDone2 = false
+			d.result = nil
+
+			//fmt.Printf("nb:%v",nb)
+			d.matchNum = uint16(nb) << 8
+			d.matchNumDone1 = true
+		}
+	} else {
+		if !d.matchNumDone2 {
+			//fmt.Printf("nb:%v",nb)
+			d.matchNum = d.matchNum + uint16(nb)
+			d.matchNumDone2 = true
+			return nil
+		}
+		//fmt.Printf("matchNum:%v",d.matchNum)
+		if d.matchNum > 0 {
+			if !d.offsetDone1 {
+				d.offset = uint16(nb) << 8
+				d.offsetDone1 = true
+				return nil
+			}
+			if !d.offsetDone2 {
+				d.offset = d.offset + uint16(nb)
+				d.offsetDone2 = true
+				return nil
+			}
+			if !d.matchLenDone1 {
+				d.matchLen = uint16(nb) << 8
+				d.matchLenDone1 = true
+				return nil
+			}
+			if !d.matchLenDone2 {
+				d.matchLen = d.matchLen + uint16(nb)
+				d.matchLenDone2 = true
+				return nil
+			}
+			//fmt.Printf("slidingWindow:%v\n",d.slidingWindow)
+			//fmt.Printf("offset:%v,matchLen:%v,next:%v\n",d.offset,d.matchLen,nb)
+			//fmt.Printf("len(d.slidingWindow):%v\n",len(d.slidingWindow))
+			d.offset = d.offset - uint16(config.SlidingWindowSize-len(d.slidingWindow))
+			//fmt.Printf("offset:%v,matchLen:%v,next:%v\n",d.offset,d.matchLen,nb)
+			d.result = append(d.result, d.slidingWindow[d.offset:d.offset+d.matchLen]...)
+			d.result = append(d.result, nb)
+			d.matchNum--
+			d.offsetDone1 = false
+			d.offsetDone2 = false
+			d.matchLenDone1 = false
+			d.matchLenDone2 = false
+
+			d.slidingWindow = append(d.slidingWindow, d.slidingWindow[d.offset:d.offset+d.matchLen]...)
+			d.slidingWindow = append(d.slidingWindow, nb)
+		} else {
+			toReturn = append(toReturn, d.result...)
+
+			d.matchStatus = false
+			d.matchNumDone1 = false
+			d.matchNumDone2 = false
+			d.offsetDone1 = false
+			d.offsetDone2 = false
+			d.matchLenDone1 = false
+			d.matchLenDone2 = false
+			d.result = nil
+
+			d.literalNum = uint16(nb) << 8
+			d.literalNumDone1 = true
 		}
 	}
-	e.done = true
-}
-
-func (e *lz4SequenceEncoder) getByByte() []uint8 {
-	if !e.done {
-		return nil
+	//fmt.Printf("slidingWindow:%v\n",d.slidingWindow)
+	//滑动窗口舍弃旧数据使得大小不超过上限
+	if len(d.slidingWindow) > config.SlidingWindowSize {
+		d.slidingWindow = d.slidingWindow[len(d.slidingWindow)-config.SlidingWindowSize:]
 	}
-	var result []uint8
-	if e.sequence.literalsLen == 0 {
-		return nil
-	}
-	result = append(result, e.sequence.literalsLen)
-	result = append(result, e.sequence.literals...)
-	result = append(result, e.sequence.offset)
-	result = append(result, e.sequence.matchLen)
-	return result
-}
-
-type lz4SequenceDecoder struct {
-	done       bool
-	sequence   sequence
-	offsetDone bool
-	matchDone  bool
-}
-
-func newLz4SequenceDecoder() *lz4SequenceDecoder {
-	return &lz4SequenceDecoder{}
-}
-
-func (d *lz4SequenceDecoder) decompressWithNewByte(nb uint8) {
-	if d.done {
-		return
-	}
-	if d.sequence.literalsLen == 0 {
-		d.sequence.literalsLen = nb
-		return
-	}
-	if uint8(len(d.sequence.literals)) < d.sequence.literalsLen {
-		d.sequence.literals = append(d.sequence.literals, nb)
-		return
-	}
-	if !d.offsetDone {
-		d.sequence.offset = nb
-		d.offsetDone = true
-		return
-	}
-	if !d.matchDone {
-		d.sequence.matchLen = nb
-		d.matchDone = true
-	}
-	d.done = true
-}
-
-func (d *lz4SequenceDecoder) getByByte() []uint8 {
-	//fmt.Printf("\ndone:%v\n", d.done)
-	if !d.done {
-		return nil
-	}
-	var result []uint8
-	result = append(result, d.sequence.literals...)
-	if d.sequence.offset != 0 {
-		from := d.sequence.literalsLen - d.sequence.offset
-		to := from + d.sequence.matchLen
-		for i := from; i < to; i++ {
-			result = append(result, d.sequence.literals[i])
-		}
-	}
-	return result
+	//fmt.Printf("toReturn:%v",toReturn)
+	return toReturn
 }

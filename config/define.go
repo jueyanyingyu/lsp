@@ -10,4 +10,9 @@ const (
 	OpUnpack
 	OpPackAndCompress
 	OpDecompressAndUnpack
+
+	HeaderBufferSize = 32
+	SlidingWindowSize = 4096
+
+	BufferSize = 1024
 )
