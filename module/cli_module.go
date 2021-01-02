@@ -3,6 +3,7 @@ package module
 import (
 	"github.com/jueyanyingyu/lsp/config"
 	"github.com/urfave/cli/v2"
+	"strings"
 )
 
 type CliModule struct {
@@ -66,19 +67,19 @@ func (m *CliModule) Init() {
 			if toCompress != "" {
 				m.OperateType = config.OpCompress
 				m.Path = toCompress
-			} else if toDecompress != "" {
+			} else if toDecompress != "" && strings.HasSuffix(toDecompress, ".cp") {
 				m.OperateType = config.OpDecompress
 				m.Path = toDecompress
 			} else if toPack != "" {
 				m.OperateType = config.OpPack
 				m.Path = toPack
-			} else if toUnpack != "" {
+			} else if toUnpack != "" && strings.HasSuffix(toUnpack, ".pk") {
 				m.OperateType = config.OpUnpack
 				m.Path = toUnpack
 			} else if toPackAndCompress != "" {
 				m.OperateType = config.OpPackAndCompress
 				m.Path = toPackAndCompress
-			} else if toDecompressAndUnpack != "" {
+			} else if toDecompressAndUnpack != "" && strings.HasSuffix(toDecompressAndUnpack, ".pk.cp") {
 				m.OperateType = config.OpDecompressAndUnpack
 				m.Path = toDecompressAndUnpack
 			} else {
