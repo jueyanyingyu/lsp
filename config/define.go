@@ -8,6 +8,6 @@ const (
 	OpDecompress
 	OpPack
 	OpUnpack
-	OpCompressWithPack
-	OpDecompressWithUnpack
+	OpPackAndCompress
+	OpDecompressAndUnpack
 )
