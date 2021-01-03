@@ -4,6 +4,7 @@ import (
 	"github.com/jueyanyingyu/lsp/config"
 	"io"
 	"log"
+	"math"
 	"strings"
 )
 
@@ -107,14 +108,20 @@ func (m *CompressModule) Decompress() error {
 	return nil
 }
 
-func getLongestPrefix(slidingWindow []uint8, headBuffer []uint8) (uint16, uint16, uint8) {
-	var maxLength uint16
+func getLongestPrefix(slidingWindow []uint8, headBuffer []uint8) (uint16, uint8, uint8) {
+	var maxLength uint8
 	var maxLengthOffset uint16
 	var next uint8
-	for i := len(headBuffer) - 1; i > 0; i-- {
+	var iBegin uint8
+	if len(headBuffer)-1 > math.MaxUint8 {
+		iBegin = math.MaxUint8
+	} else {
+		iBegin = uint8(len(headBuffer) - 1)
+	}
+	for i := iBegin; i >= config.MinPrefixSize; i-- {
 		index := strings.Index(string(slidingWindow), string(headBuffer[:i]))
 		if index >= 0 {
-			maxLength = uint16(i)
+			maxLength = i
 			maxLengthOffset = uint16(index)
 			next = headBuffer[i]
 			break
@@ -130,10 +137,12 @@ type lz77SequenceEncoder struct {
 	slidingWindow []uint8
 	headerBuffer  []uint8
 
-	matchStatus bool
-	literalNum  uint16
-	matchNum    uint16
-	result      []uint8
+	matchStatus    bool
+	literalNum     uint8
+	matchNum       uint8
+	literalNumList []uint8
+	matchNumList   []uint8
+	result         []uint8
 }
 
 func newLz77SequenceEncoder() *lz77SequenceEncoder {
@@ -170,14 +179,22 @@ func (e *lz77SequenceEncoder) compressWithNewByte(nb uint8) []uint8 {
 	if !e.matchStatus {
 		//字面量状态
 		if matchLen == 0 {
-			//新增字面量
+			//新增字面量 //超过上限就扩展位来记录
+			if e.literalNum == math.MaxUint8 {
+				e.literalNumList = append(e.literalNumList, math.MaxUint8)
+				e.literalNum = 0
+			}
 			e.literalNum++
 			e.result = append(e.result, next)
 		} else {
 			//出现匹配项，字面量数据输出
-			toReturn = append(toReturn, uint8(e.literalNum>>8))
-			toReturn = append(toReturn, uint8(e.literalNum))
+			toReturn = append(toReturn, e.literalNumList...)
+			toReturn = append(toReturn, e.literalNum)
+			if e.literalNum == math.MaxUint8 {
+				toReturn = append(toReturn, 0)
+			}
 			toReturn = append(toReturn, e.result...)
+			e.literalNumList = nil
 			e.literalNum = 0
 			e.result = nil
 			e.matchStatus = true
@@ -186,17 +203,20 @@ func (e *lz77SequenceEncoder) compressWithNewByte(nb uint8) []uint8 {
 			e.matchNum++
 			e.result = append(e.result, uint8(offset>>8))
 			e.result = append(e.result, uint8(offset))
-			e.result = append(e.result, uint8(matchLen>>8))
-			e.result = append(e.result, uint8(matchLen))
+			e.result = append(e.result, matchLen)
 			e.result = append(e.result, next)
 		}
 	} else {
 		if matchLen == 0 {
 			//出现字面量，匹配项数据输出
 			//fmt.Printf("e.matchNum:%v",e.matchNum)
-			toReturn = append(toReturn, uint8(e.matchNum>>8))
-			toReturn = append(toReturn, uint8(e.matchNum))
+			toReturn = append(toReturn, e.matchNumList...)
+			toReturn = append(toReturn, e.matchNum)
+			if e.matchNum == math.MaxUint8 {
+				toReturn = append(toReturn, 0)
+			}
 			toReturn = append(toReturn, e.result...)
+			e.matchNumList = nil
 			e.matchNum = 0
 			e.result = nil
 			e.matchStatus = false
@@ -205,12 +225,15 @@ func (e *lz77SequenceEncoder) compressWithNewByte(nb uint8) []uint8 {
 			e.literalNum++
 			e.result = append(e.result, next)
 		} else {
-			//新增匹配项
+			//新增匹配项 超过就扩展
+			if e.matchNum == math.MaxUint8 {
+				e.matchNumList = append(e.matchNumList, math.MaxUint8)
+				e.matchNum = 0
+			}
 			e.matchNum++
 			e.result = append(e.result, uint8(offset>>8))
 			e.result = append(e.result, uint8(offset))
-			e.result = append(e.result, uint8(matchLen>>8))
-			e.result = append(e.result, uint8(matchLen))
+			e.result = append(e.result, matchLen)
 			e.result = append(e.result, next)
 		}
 	}
@@ -241,14 +264,22 @@ func (e *lz77SequenceEncoder) compress() []uint8 {
 		if !e.matchStatus {
 			//字面量状态
 			if matchLen == 0 {
-				//新增字面量
+				//新增字面量 //超过上限就扩展位来记录
+				if e.literalNum == math.MaxUint8 {
+					e.literalNumList = append(e.literalNumList, math.MaxUint8)
+					e.literalNum = 0
+				}
 				e.literalNum++
 				e.result = append(e.result, next)
 			} else {
 				//出现匹配项，字面量数据输出
-				toReturn = append(toReturn, uint8(e.literalNum>>8))
-				toReturn = append(toReturn, uint8(e.literalNum))
+				toReturn = append(toReturn, e.literalNumList...)
+				toReturn = append(toReturn, e.literalNum)
+				if e.literalNum == math.MaxUint8 {
+					toReturn = append(toReturn, 0)
+				}
 				toReturn = append(toReturn, e.result...)
+				e.literalNumList = nil
 				e.literalNum = 0
 				e.result = nil
 				e.matchStatus = true
@@ -257,17 +288,20 @@ func (e *lz77SequenceEncoder) compress() []uint8 {
 				e.matchNum++
 				e.result = append(e.result, uint8(offset>>8))
 				e.result = append(e.result, uint8(offset))
-				e.result = append(e.result, uint8(matchLen>>8))
-				e.result = append(e.result, uint8(matchLen))
+				e.result = append(e.result, matchLen)
 				e.result = append(e.result, next)
 			}
 		} else {
 			if matchLen == 0 {
 				//出现字面量，匹配项数据输出
 				//fmt.Printf("e.matchNum:%v",e.matchNum)
-				toReturn = append(toReturn, uint8(e.matchNum>>8))
-				toReturn = append(toReturn, uint8(e.matchNum))
+				toReturn = append(toReturn, e.matchNumList...)
+				toReturn = append(toReturn, e.matchNum)
+				if e.matchNum == math.MaxUint8 {
+					toReturn = append(toReturn, 0)
+				}
 				toReturn = append(toReturn, e.result...)
+				e.matchNumList = nil
 				e.matchNum = 0
 				e.result = nil
 				e.matchStatus = false
@@ -276,19 +310,33 @@ func (e *lz77SequenceEncoder) compress() []uint8 {
 				e.literalNum++
 				e.result = append(e.result, next)
 			} else {
-				//新增匹配项
+				//新增匹配项 超过就扩展
+				if e.matchNum == math.MaxUint8 {
+					e.matchNumList = append(e.matchNumList, math.MaxUint8)
+					e.matchNum = 0
+				}
 				e.matchNum++
 				e.result = append(e.result, uint8(offset>>8))
 				e.result = append(e.result, uint8(offset))
-				e.result = append(e.result, uint8(matchLen>>8))
-				e.result = append(e.result, uint8(matchLen))
+				e.result = append(e.result, matchLen)
 				e.result = append(e.result, next)
 			}
 		}
 		totalResult = append(totalResult, toReturn...)
 	}
-	totalResult = append(totalResult, uint8(e.matchNum>>8))
-	totalResult = append(totalResult, uint8(e.matchNum))
+	if e.matchStatus {
+		totalResult = append(totalResult, e.matchNumList...)
+		totalResult = append(totalResult, e.matchNum)
+		if e.matchNum == math.MaxUint8 {
+			totalResult = append(totalResult, 0)
+		}
+	} else {
+		totalResult = append(totalResult, e.literalNumList...)
+		totalResult = append(totalResult, e.literalNum)
+		if e.literalNum == math.MaxUint8 {
+			totalResult = append(totalResult, 0)
+		}
+	}
 	totalResult = append(totalResult, e.result...)
 	//fmt.Printf("result:%v",totalResult)
 	return totalResult
@@ -297,20 +345,19 @@ func (e *lz77SequenceEncoder) compress() []uint8 {
 type lz77SequenceDecoder struct {
 	slidingWindow []uint8
 	offset        uint16
-	matchLen      uint16
+	matchLen      uint8
 	offsetDone1   bool
 	offsetDone2   bool
-	matchLenDone1 bool
-	matchLenDone2 bool
+	matchLenDone  bool
 
-	matchStatus     bool
-	literalNum      uint16
-	literalNumDone1 bool
-	literalNumDone2 bool
-	matchNum        uint16
-	matchNumDone1   bool
-	matchNumDone2   bool
-	result          []uint8
+	matchStatus        bool
+	literalNum         uint8
+	literalNumList     []uint8
+	literalNumDone     bool
+	matchNum           uint8
+	matchNumList       []uint8
+	matchNumDone       bool
+	result             []uint8
 }
 
 func newLz77SequenceDecoder() *lz77SequenceDecoder {
@@ -318,19 +365,27 @@ func newLz77SequenceDecoder() *lz77SequenceDecoder {
 }
 
 func (d *lz77SequenceDecoder) decompressWithNewByte(nb uint8) []uint8 {
-	//fmt.Printf("%v ",nb)
+	//fmt.Printf("slidingWindow:%v",d.slidingWindow)
+	//fmt.Printf("\nnb:%v ",nb)
+	//fmt.Printf("literalNum:%v ",d.literalNum)
+	//fmt.Printf("matchNum:%v\n",d.matchNum)
+	//fmt.Printf("literalNum:%v,list:%v,matchNum:%v,list:%v,offset:%v,matchLen:%v,next:%v\n", d.literalNum,d.literalNumList, d.matchNum,d.matchNumList, d.offset, d.matchLen, nb)
 	var toReturn []uint8
 	if !d.matchStatus {
-		if !d.literalNumDone1 {
-			d.literalNum = uint16(nb) << 8
-			d.literalNumDone1 = true
+		if !d.literalNumDone {
+			if nb == math.MaxUint8 {
+				d.literalNumList = append(d.literalNumList, math.MaxUint8)
+			} else {
+				d.literalNum = nb
+				d.literalNumDone = true
+			}
 			return nil
 		}
-		if !d.literalNumDone2 {
-			d.literalNum = d.literalNum + uint16(nb)
-			d.literalNumDone2 = true
-			return nil
+		if d.literalNum == 0 && len(d.literalNumList) > 0 {
+			d.literalNum = d.literalNumList[0]
+			d.literalNumList = d.literalNumList[1:]
 		}
+		//fmt.Printf("num:%v,list:%v\n",d.literalNum,d.literalNumList)
 		if d.literalNum > 0 {
 			d.result = append(d.result, nb)
 			d.slidingWindow = append(d.slidingWindow, nb)
@@ -339,72 +394,80 @@ func (d *lz77SequenceDecoder) decompressWithNewByte(nb uint8) []uint8 {
 			toReturn = append(toReturn, d.result...)
 
 			d.matchStatus = true
-			d.literalNumDone1 = false
-			d.literalNumDone2 = false
+			d.literalNumDone = false
+			d.literalNumList = nil
 			d.result = nil
 
 			//fmt.Printf("nb:%v",nb)
-			d.matchNum = uint16(nb) << 8
-			d.matchNumDone1 = true
+			if nb == math.MaxUint8 {
+				d.matchNumList = append(d.matchNumList, math.MaxUint8)
+			} else {
+				d.matchNum = nb
+				d.matchNumDone = true
+			}
 		}
 	} else {
-		if !d.matchNumDone2 {
-			//fmt.Printf("nb:%v",nb)
-			d.matchNum = d.matchNum + uint16(nb)
-			d.matchNumDone2 = true
+		//fmt.Printf("matchNum:%v",d.matchNum)
+		if !d.matchNumDone {
+			if nb == math.MaxUint8 {
+				d.matchNumList = append(d.matchNumList, math.MaxUint8)
+			} else {
+				d.matchNum = nb
+				d.matchNumDone = true
+			}
 			return nil
 		}
-		//fmt.Printf("matchNum:%v",d.matchNum)
+		if d.matchNum == 0 && len(d.matchNumList) > 0 {
+			d.matchNum = d.matchNumList[0]
+			d.matchNumList = d.matchNumList[1:]
+		}
 		if d.matchNum > 0 {
 			if !d.offsetDone1 {
+				//fmt.Printf("%v\n",nb)
 				d.offset = uint16(nb) << 8
 				d.offsetDone1 = true
 				return nil
 			}
 			if !d.offsetDone2 {
+				//fmt.Printf("%v\n",nb)
 				d.offset = d.offset + uint16(nb)
 				d.offsetDone2 = true
 				return nil
 			}
-			if !d.matchLenDone1 {
-				d.matchLen = uint16(nb) << 8
-				d.matchLenDone1 = true
-				return nil
-			}
-			if !d.matchLenDone2 {
-				d.matchLen = d.matchLen + uint16(nb)
-				d.matchLenDone2 = true
+			if !d.matchLenDone {
+				d.matchLen = nb
+				d.matchLenDone = true
 				return nil
 			}
 			//fmt.Printf("slidingWindow:%v\n",d.slidingWindow)
 			//fmt.Printf("offset:%v,matchLen:%v,next:%v\n",d.offset,d.matchLen,nb)
-			//fmt.Printf("len(d.slidingWindow):%v\n",len(d.slidingWindow))
 			d.offset = d.offset - uint16(config.SlidingWindowSize-len(d.slidingWindow))
-			//fmt.Printf("offset:%v,matchLen:%v,next:%v\n",d.offset,d.matchLen,nb)
-			d.result = append(d.result, d.slidingWindow[d.offset:d.offset+d.matchLen]...)
+			d.result = append(d.result, d.slidingWindow[d.offset:d.offset+uint16(d.matchLen)]...)
 			d.result = append(d.result, nb)
 			d.matchNum--
 			d.offsetDone1 = false
 			d.offsetDone2 = false
-			d.matchLenDone1 = false
-			d.matchLenDone2 = false
+			d.matchLenDone = false
 
-			d.slidingWindow = append(d.slidingWindow, d.slidingWindow[d.offset:d.offset+d.matchLen]...)
+			d.slidingWindow = append(d.slidingWindow, d.slidingWindow[d.offset:d.offset+uint16(d.matchLen)]...)
 			d.slidingWindow = append(d.slidingWindow, nb)
 		} else {
 			toReturn = append(toReturn, d.result...)
 
 			d.matchStatus = false
-			d.matchNumDone1 = false
-			d.matchNumDone2 = false
+			d.matchNumDone = false
+			d.matchNumList = nil
 			d.offsetDone1 = false
 			d.offsetDone2 = false
-			d.matchLenDone1 = false
-			d.matchLenDone2 = false
+			d.matchLenDone = false
 			d.result = nil
 
-			d.literalNum = uint16(nb) << 8
-			d.literalNumDone1 = true
+			if nb == math.MaxUint8 {
+				d.literalNumList = append(d.literalNumList, math.MaxUint8)
+			} else {
+				d.literalNum = nb
+				d.literalNumDone = true
+			}
 		}
 	}
 	//fmt.Printf("slidingWindow:%v\n",d.slidingWindow)
@@ -412,6 +475,7 @@ func (d *lz77SequenceDecoder) decompressWithNewByte(nb uint8) []uint8 {
 	if len(d.slidingWindow) > config.SlidingWindowSize {
 		d.slidingWindow = d.slidingWindow[len(d.slidingWindow)-config.SlidingWindowSize:]
 	}
+	//fmt.Printf("len(d.slidingWindow):%v\n",len(d.slidingWindow))
 	//fmt.Printf("toReturn:%v",toReturn)
 	return toReturn
 }

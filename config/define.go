@@ -15,4 +15,6 @@ const (
 	SlidingWindowSize = 4096
 
 	BufferSize = 1024
+
+	MinPrefixSize = 5
 )
