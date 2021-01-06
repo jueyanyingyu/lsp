@@ -5,7 +5,6 @@ import (
 	"io"
 	"log"
 	"math"
-	"strings"
 )
 
 type CompressModule struct {
@@ -108,30 +107,49 @@ func (m *CompressModule) Decompress() error {
 	return nil
 }
 
-func getLongestPrefix(slidingWindow []uint8, headBuffer []uint8) (uint16, uint8, uint8) {
-	var maxLength uint8
-	var maxLengthOffset uint16
-	var next uint8
-	var iBegin uint8
-	if len(headBuffer)-1 > math.MaxUint8 {
-		iBegin = math.MaxUint8
-	} else {
-		iBegin = uint8(len(headBuffer) - 1)
-	}
-	for i := iBegin; i >= config.MinPrefixSize; i-- {
-		index := strings.Index(string(slidingWindow), string(headBuffer[:i]))
-		if index >= 0 {
-			maxLength = i
-			maxLengthOffset = uint16(index)
-			next = headBuffer[i]
-			break
-		}
-	}
-	if maxLength == 0 {
-		next = headBuffer[0]
-	}
-	return maxLengthOffset, maxLength, next
-}
+//func getNextOptimize(p []byte) []int {
+//	pLen := len(p)
+//	next := make([]int, pLen, pLen)
+//	next[0] = -1
+//	next[1] = 0
+//	i := 0
+//	j := 1
+//	for j < pLen-1 { //因为next[pLen-1]由s[i] == s[pLen-2]算出
+//		if i == -1 || p[i] == p[j] { //-1代表了起始位不匹配，i=0,s[0]!=s[j]=>i=next[0]=-1
+//			i++
+//			j++
+//			if p[i] != p[j] { //因为出现在j位置不匹配的话会跳到next[j]=i位置去匹配,p[i] == p[j]肯定又是不匹配（优化核心点）
+//				next[j] = i
+//			} else {
+//				next[j] = next[i]
+//			}
+//
+//		} else {
+//			i = next[i]
+//		}
+//	}
+//	return next
+//}
+//
+//func kmpSearch(s, p []byte) int {
+//	i, j := 0, 0
+//	pLen := len(p)
+//	sLen := len(s)
+//	next := getNextOptimize(p)
+//	for i < sLen && j < pLen {
+//		if j == -1 || s[i] == p[j] { //s[i]!=s[0]=>j=next[0]=-1,第0位不匹配所以i++，j++;j=0
+//			i++
+//			j++
+//		} else {
+//			j = next[j]
+//		}
+//	}
+//	if j == pLen {
+//		return i - j
+//	} else {
+//		return -1
+//	}
+//}
 
 type lz77SequenceEncoder struct {
 	slidingWindow []uint8
@@ -143,33 +161,113 @@ type lz77SequenceEncoder struct {
 	literalNumList []uint8
 	matchNumList   []uint8
 	result         []uint8
+
+	hashMap             map[uint32][]uint64
+	slidingWindowOffset uint64
 }
 
 func newLz77SequenceEncoder() *lz77SequenceEncoder {
-	return &lz77SequenceEncoder{}
+	return &lz77SequenceEncoder{
+		hashMap: make(map[uint32][]uint64),
+	}
 }
 
+func (e *lz77SequenceEncoder) updateHash(matchLen uint8) {
+	if len(e.slidingWindow) < 4 {
+		return
+	}
+	iBegin := len(e.slidingWindow) - int(matchLen)
+	if iBegin <= 3 {
+		iBegin = 3
+	}
+	//fmt.Printf("len(e.slidingWindow):%v,int(matchLen):%v\n",len(e.slidingWindow),int(matchLen))
+	for i := iBegin; i < len(e.slidingWindow); i++ {
+		k := uint32(e.slidingWindow[i]) + uint32(e.slidingWindow[i-1])<<8 + uint32(e.slidingWindow[i-2])<<16 + uint32(e.slidingWindow[i-3])<<24
+		e.hashMap[k] = append(e.hashMap[k], e.slidingWindowOffset+uint64(i-3))
+	}
+}
+func (e *lz77SequenceEncoder) getHashOffset(k uint32) []uint64 {
+	if v, ok := e.hashMap[k]; ok {
+		var newV []uint64
+		for _, h := range v {
+			if h >= e.slidingWindowOffset {
+				newV = append(newV, h)
+			}
+		}
+		e.hashMap[k] = newV
+		//fmt.Printf("\nnewV:%v\n",newV)
+		return newV
+	}
+	return nil
+}
+func (e *lz77SequenceEncoder) getLongestPrefix(slidingWindow []uint8, headBuffer []uint8) (uint16, uint8, uint8) {
+	var maxLength uint8
+	var maxLengthOffset uint16
+	var next uint8
+	if len(headBuffer) < 4 {
+		next = headBuffer[0]
+		return maxLengthOffset, maxLength, next
+	}
+	k := uint32(headBuffer[0]) + uint32(headBuffer[1])<<8 + uint32(headBuffer[2])<<16 + uint32(headBuffer[3])<<24
+	indexList := e.getHashOffset(k)
+	for _, index := range indexList {
+		if index >= 0 {
+			length := uint8(0)
+			//fmt.Printf("index:%v,slidingWindowOffset:%v\n",index,e.slidingWindowOffset)
+			iBegin := index - e.slidingWindowOffset
+			i := iBegin
+			j := 0
+			for ; int(i) < len(slidingWindow) && j < len(headBuffer)-1 && slidingWindow[i] == headBuffer[j]; {
+				length++
+				i++
+				j++
+			}
+			if length > config.MinPrefixSize && length > maxLength {
+				maxLength = length
+				maxLengthOffset = uint16(iBegin)
+				next = headBuffer[j]
+			}
+		}
+	}
+	if maxLength == 0 {
+		next = headBuffer[0]
+	}
+	return maxLengthOffset, maxLength, next
+}
 func (e *lz77SequenceEncoder) compressWithNewByte(nb uint8) []uint8 {
-	//fmt.Printf("nb:%v",nb)
+
+	//fmt.Printf("hashMap:%v\n",e.hashMap)
 	//缓冲区不足补入
 	if len(e.headerBuffer) < config.HeaderBufferSize {
 		//fmt.Printf("nb:%v",nb)
 		e.headerBuffer = append(e.headerBuffer, nb)
 		return nil
 	}
-	offset, matchLen, next := getLongestPrefix(e.slidingWindow, e.headerBuffer)
-	//fmt.Printf("offset:%v,matchLen:%v,next:%v",offset,matchLen,next)
+	//fmt.Printf("\n\n\nslidingWindow:%v  headerBuffer:%v\n",e.slidingWindow,e.headerBuffer)
+	offset, matchLen, next := e.getLongestPrefix(e.slidingWindow, e.headerBuffer)
+	//fmt.Printf("offset:%v,matchLen:%v,next:%v\n",offset,matchLen,next)
 	//补偿因为滑动窗口未满导致的偏移误差
 	if matchLen != 0 {
+		//fmt.Printf("offset:%v,matchLen:%v,next:%v\n", offset, matchLen, next)
 		offset = offset + uint16(config.SlidingWindowSize-len(e.slidingWindow))
 	}
+	//fmt.Printf("slidingWindow:%v  headerBuffer:%v\n",e.slidingWindow,e.headerBuffer)
 	//匹配部分加入滑动窗口
 	e.slidingWindow = append(e.slidingWindow, e.headerBuffer[:matchLen+1]...)
+	//fmt.Printf("slidingWindowOffset:%v\n",e.slidingWindowOffset)
 	//滑动窗口舍弃旧数据使得大小不超过上限
 	if len(e.slidingWindow) > config.SlidingWindowSize {
-		e.slidingWindow = e.slidingWindow[len(e.slidingWindow)-config.SlidingWindowSize:]
+		dropLen := len(e.slidingWindow) - config.SlidingWindowSize
+		e.slidingWindow = e.slidingWindow[dropLen:]
+		e.slidingWindowOffset = e.slidingWindowOffset + uint64(dropLen)
 	}
+	//fmt.Printf("slidingWindowOffset:%v\n",e.slidingWindowOffset)
+	//fmt.Printf("hashMap:%v\n",e.hashMap)
+	e.updateHash(matchLen + 1)
+	//fmt.Printf("hashMap:%v\n",e.hashMap)
+
 	e.headerBuffer = e.headerBuffer[matchLen+1:]
+	//fmt.Printf("slidingWindow:%v  headerBuffer:%v\n",e.slidingWindow,e.headerBuffer)
 	if len(e.headerBuffer) < config.HeaderBufferSize {
 		//fmt.Printf("nb:%v",nb)
 		e.headerBuffer = append(e.headerBuffer, nb)
@@ -243,7 +341,7 @@ func (e *lz77SequenceEncoder) compressWithNewByte(nb uint8) []uint8 {
 func (e *lz77SequenceEncoder) compress() []uint8 {
 	var totalResult []uint8
 	for len(e.headerBuffer) > 0 {
-		offset, matchLen, next := getLongestPrefix(e.slidingWindow, e.headerBuffer)
+		offset, matchLen, next := e.getLongestPrefix(e.slidingWindow, e.headerBuffer)
 		//补偿因为滑动窗口未满导致的偏移误差
 		if matchLen != 0 {
 			offset = offset + uint16(config.SlidingWindowSize-len(e.slidingWindow))
@@ -255,8 +353,11 @@ func (e *lz77SequenceEncoder) compress() []uint8 {
 		e.slidingWindow = append(e.slidingWindow, e.headerBuffer[:matchLen+1]...)
 		//滑动窗口舍弃旧数据使得大小不超过上限
 		if len(e.slidingWindow) > config.SlidingWindowSize {
-			e.slidingWindow = e.slidingWindow[len(e.slidingWindow)-config.SlidingWindowSize:]
+			dropLen := len(e.slidingWindow) - config.SlidingWindowSize
+			e.slidingWindow = e.slidingWindow[dropLen:]
+			e.slidingWindowOffset = e.slidingWindowOffset + uint64(dropLen)
 		}
+		e.updateHash(matchLen + 1)
 		e.headerBuffer = e.headerBuffer[matchLen+1:]
 		//fmt.Printf("slidingWindow:%v",e.slidingWindow)
 		//fmt.Printf("headerBuffer:%v\n",e.headerBuffer)
@@ -350,14 +451,14 @@ type lz77SequenceDecoder struct {
 	offsetDone2   bool
 	matchLenDone  bool
 
-	matchStatus        bool
-	literalNum         uint8
-	literalNumList     []uint8
-	literalNumDone     bool
-	matchNum           uint8
-	matchNumList       []uint8
-	matchNumDone       bool
-	result             []uint8
+	matchStatus    bool
+	literalNum     uint8
+	literalNumList []uint8
+	literalNumDone bool
+	matchNum       uint8
+	matchNumList   []uint8
+	matchNumDone   bool
+	result         []uint8
 }
 
 func newLz77SequenceDecoder() *lz77SequenceDecoder {

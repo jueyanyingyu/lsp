@@ -23,10 +23,32 @@ func main() {
 		log.Printf("wrong command")
 		return
 	}
-	source, err := os.Open(cliModule.Path)
+
+	var inputName = cliModule.Path
+	var outputName string
+	switch cliModule.OperateType {
+	case config.OpCompress:
+		outputName = cliModule.Path + ".cp"
+		err = compress(inputName, outputName)
+	case config.OpDecompress:
+		outputName = cliModule.Path[:strings.LastIndex(cliModule.Path, ".cp")]
+		err = decompress(inputName, outputName)
+	case config.OpPack:
+		outputName = cliModule.Path + ".pk"
+	case config.OpUnpack:
+		outputName = cliModule.Path[:strings.LastIndex(cliModule.Path, ".pk")]
+	case config.OpPackAndCompress:
+		outputName = cliModule.Path + ".pk.cp"
+	case config.OpDecompressAndUnpack:
+		outputName = cliModule.Path[:strings.LastIndex(cliModule.Path, ".pk.cp")]
+	}
+}
+
+func compress(inputName, outputName string) error {
+	source, err := os.Open(inputName)
 	if err != nil {
 		log.Printf("open source err:%v", err)
-		return
+		return err
 	}
 	defer func() {
 		if err := source.Close(); err != nil {
@@ -34,27 +56,10 @@ func main() {
 			return
 		}
 	}()
-
-	var newFile string
-	switch cliModule.OperateType {
-	case config.OpCompress:
-		newFile = cliModule.Path + ".cp"
-	case config.OpDecompress:
-		newFile = cliModule.Path[:strings.LastIndex(cliModule.Path, ".cp")]
-	case config.OpPack:
-		newFile = cliModule.Path + ".pk"
-	case config.OpUnpack:
-		newFile = cliModule.Path[:strings.LastIndex(cliModule.Path, ".pk")]
-	case config.OpPackAndCompress:
-		newFile = cliModule.Path + ".pk.cp"
-	case config.OpDecompressAndUnpack:
-		newFile = cliModule.Path[:strings.LastIndex(cliModule.Path, ".pk.cp")]
-	}
-
-	target, err := os.Create(newFile)
+	target, err := os.Create(outputName)
 	if err != nil {
 		log.Printf("create target err:%v", err)
-		return
+		return err
 	}
 	defer func() {
 		if err := target.Close(); err != nil {
@@ -62,23 +67,8 @@ func main() {
 			return
 		}
 	}()
-
 	bufSource := bufio.NewReader(source)
 	bufTarget := bufio.NewWriter(target)
-
-	switch cliModule.OperateType {
-	case config.OpCompress:
-		err = compress(bufSource, bufTarget)
-	case config.OpDecompress:
-		err = decompress(bufSource, bufTarget)
-	case config.OpPack:
-	case config.OpUnpack:
-	case config.OpPackAndCompress:
-	case config.OpDecompressAndUnpack:
-	}
-}
-
-func compress(source *bufio.Reader, target *bufio.Writer) error {
 	out1, in1 := io.Pipe()
 	out2, in2 := io.Pipe()
 
@@ -110,7 +100,7 @@ func compress(source *bufio.Reader, target *bufio.Writer) error {
 				break
 			}
 		}
-	}(source, in1)
+	}(bufSource, in1)
 
 	wg.Add(1)
 	go func(module *module.CompressModule) {
@@ -146,13 +136,37 @@ func compress(source *bufio.Reader, target *bufio.Writer) error {
 				break
 			}
 		}
-	}(target, out2)
+	}(bufTarget, out2)
 
 	wg.Wait()
 
 	return nil
 }
-func decompress(source *bufio.Reader, target *bufio.Writer) error {
+func decompress(inputName, outputName string) error {
+	source, err := os.Open(inputName)
+	if err != nil {
+		log.Printf("open source err:%v", err)
+		return err
+	}
+	defer func() {
+		if err := source.Close(); err != nil {
+			log.Printf("close source err:%v", err)
+			return
+		}
+	}()
+	target, err := os.Create(outputName)
+	if err != nil {
+		log.Printf("create target err:%v", err)
+		return err
+	}
+	defer func() {
+		if err := target.Close(); err != nil {
+			log.Printf("close target err:%v", err)
+			return
+		}
+	}()
+	bufSource := bufio.NewReader(source)
+	bufTarget := bufio.NewWriter(target)
 	out1, in1 := io.Pipe()
 	out2, in2 := io.Pipe()
 
@@ -184,7 +198,7 @@ func decompress(source *bufio.Reader, target *bufio.Writer) error {
 				break
 			}
 		}
-	}(source, in1)
+	}(bufSource, in1)
 
 	wg.Add(1)
 	go func(module *module.CompressModule) {
@@ -220,7 +234,7 @@ func decompress(source *bufio.Reader, target *bufio.Writer) error {
 				break
 			}
 		}
-	}(target, out2)
+	}(bufTarget, out2)
 
 	wg.Wait()
 
