@@ -1,6 +1,7 @@
 package module
 
 import (
+	"bufio"
 	"github.com/jueyanyingyu/lsp/config"
 	"io"
 	"log"
@@ -8,11 +9,11 @@ import (
 )
 
 type CompressModule struct {
-	reader *io.PipeReader
-	writer *io.PipeWriter
+	reader *bufio.Reader
+	writer *bufio.Writer
 }
 
-func NewCompressModule(reader *io.PipeReader, writer *io.PipeWriter) *CompressModule {
+func NewCompressModule(reader *bufio.Reader, writer *bufio.Writer) *CompressModule {
 	return &CompressModule{
 		reader: reader,
 		writer: writer,
@@ -22,42 +23,28 @@ func NewCompressModule(reader *io.PipeReader, writer *io.PipeWriter) *CompressMo
 func (m *CompressModule) Compress() error {
 	encoder := newLz77SequenceEncoder()
 	for {
-		var buffer []uint8
-		nb := make([]uint8, config.BufferSize)
-		n, err := m.reader.Read(nb)
-		if n > 0 {
-			buffer = append(buffer, nb[0:n]...)
-			//fmt.Printf("buffer:%v",buffer)
-			var result []uint8
-			for _, v := range buffer {
-				//fmt.Printf("v:%v",v)
-				result = append(result, encoder.compressWithNewByte(v)...)
-			}
-			_, err := m.writer.Write(result)
-			if err != nil {
-				log.Printf("write to stream err:%v", err)
-				return err
-			}
-		}
+		nb, err := m.reader.ReadByte()
 		if err != nil && err != io.EOF {
 			log.Printf("read from stream err:%v", err)
 			return err
 		}
 		if err == io.EOF {
-			var result []uint8
-			result = append(result, encoder.compress()...)
-			//fmt.Printf("result:%v",result)
-			_, err := m.writer.Write(result)
+			_, err := m.writer.Write(encoder.compress())
 			if err != nil {
 				log.Printf("write to stream err:%v", err)
 				return err
 			}
 			break
 		}
+		_, err = m.writer.Write(encoder.compressWithNewByte(nb))
+		if err != nil {
+			log.Printf("write to stream err:%v", err)
+			return err
+		}
 	}
-	err := m.writer.Close()
+	err := m.writer.Flush()
 	if err != nil {
-		log.Printf("close write err:%v", err)
+		log.Printf("flush write err:%v", err)
 		return err
 	}
 	return nil
@@ -66,42 +53,28 @@ func (m *CompressModule) Compress() error {
 func (m *CompressModule) Decompress() error {
 	decoder := newLz77SequenceDecoder()
 	for {
-		var buffer []uint8
-		nb := make([]uint8, config.BufferSize)
-		n, err := m.reader.Read(nb)
-		if n > 0 {
-			buffer = append(buffer, nb[0:n]...)
-			//fmt.Printf("buffer:%v\n",buffer)
-			var result []uint8
-			for _, v := range buffer {
-				result = append(result, decoder.decompressWithNewByte(v)...)
-			}
-			//fmt.Printf("%v",decoder.result)
-			_, err := m.writer.Write(result)
-			if err != nil {
-				log.Printf("write to stream err:%v", err)
-				return err
-			}
-		}
+		nb, err := m.reader.ReadByte()
 		if err != nil && err != io.EOF {
 			log.Printf("read from stream err:%v", err)
 			return err
 		}
 		if err == io.EOF {
-			var result []uint8
-			result = append(result, decoder.result...)
-			//fmt.Printf("result:%v",result)
-			_, err := m.writer.Write(result)
+			_, err := m.writer.Write(decoder.result)
 			if err != nil {
 				log.Printf("write to stream err:%v", err)
 				return err
 			}
 			break
 		}
+		_, err = m.writer.Write(decoder.decompressWithNewByte(nb))
+		if err != nil {
+			log.Printf("write to stream err:%v", err)
+			return err
+		}
 	}
-	err := m.writer.Close()
+	err := m.writer.Flush()
 	if err != nil {
-		log.Printf("close write err:%v", err)
+		log.Printf("flush write err:%v", err)
 		return err
 	}
 	return nil

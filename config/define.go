@@ -11,8 +11,8 @@ const (
 	OpPackAndCompress
 	OpDecompressAndUnpack
 
-	HeaderBufferSize = 128
-	SlidingWindowSize = 65536
+	HeaderBufferSize  = 1 << 7
+	SlidingWindowSize = 1 << 16
 
 	BufferSize = 1024
 
